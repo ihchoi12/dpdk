@@ -15,6 +15,8 @@
 #include <stdbool.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <signal.h>
+#include <netinet/in.h>
 
 #include <rte_debug.h>
 #include <rte_ether.h>
@@ -30,6 +32,7 @@
 #include "l3fwd.h"
 #include "l3fwd_common.h"
 #include "l3fwd_event.h"
+#include "l3fwd_pcm.h"
 
 #include "lpm_route_parse.c"
 
@@ -40,6 +43,265 @@
 
 static struct rte_lpm *ipv4_l3fwd_lpm_lookup_struct[NB_SOCKETS];
 static struct rte_lpm6 *ipv6_l3fwd_lpm_lookup_struct[NB_SOCKETS];
+
+/* Global array of packet statistics per lcore */
+struct lcore_packet_stats lcore_stats[RTE_MAX_LCORE];
+
+/* Check if a packet is a DHCP packet (UDP ports 67/68) */
+int
+is_dhcp_packet(struct rte_mbuf *pkt)
+{
+    struct rte_ether_hdr *eth_hdr;
+    struct rte_ipv4_hdr *ipv4_hdr;
+    struct rte_udp_hdr *udp_hdr;
+    uint16_t src_port, dst_port;
+
+    /* Check if packet is large enough and is IPv4 */
+    if (rte_pktmbuf_data_len(pkt) < sizeof(*eth_hdr) + sizeof(*ipv4_hdr) + sizeof(*udp_hdr))
+        return 0;
+
+    eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+    if (rte_be_to_cpu_16(eth_hdr->ether_type) != RTE_ETHER_TYPE_IPV4)
+        return 0;
+
+    ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+    if (ipv4_hdr->next_proto_id != IPPROTO_UDP)
+        return 0;
+
+    udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + sizeof(*ipv4_hdr));
+    src_port = rte_be_to_cpu_16(udp_hdr->src_port);
+    dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
+
+    /* DHCP uses ports 67 (server) and 68 (client) */
+    return (src_port == 67 || src_port == 68 || dst_port == 67 || dst_port == 68);
+}
+
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+/* Analyze and log packet details */
+void
+analyze_packet(struct rte_mbuf *pkt, unsigned int lcore_id, const char *direction, uint16_t queue_id)
+{
+	struct rte_ether_hdr *eth_hdr;
+	struct rte_ipv4_hdr *ipv4_hdr;
+	struct rte_tcp_hdr *tcp_hdr;
+	struct rte_udp_hdr *udp_hdr;
+	uint32_t src_ip, dst_ip;
+	uint16_t src_port = 0, dst_port = 0;
+	uint8_t proto;
+	char src_ip_str[INET_ADDRSTRLEN];
+	char dst_ip_str[INET_ADDRSTRLEN];
+	char src_mac_str[18];
+	char dst_mac_str[18];
+
+	eth_hdr = rte_pktmbuf_mtod(pkt, struct rte_ether_hdr *);
+
+	/* Convert MAC addresses to string format */
+	snprintf(src_mac_str, sizeof(src_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+		 eth_hdr->src_addr.addr_bytes[0], eth_hdr->src_addr.addr_bytes[1],
+		 eth_hdr->src_addr.addr_bytes[2], eth_hdr->src_addr.addr_bytes[3],
+		 eth_hdr->src_addr.addr_bytes[4], eth_hdr->src_addr.addr_bytes[5]);
+	snprintf(dst_mac_str, sizeof(dst_mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+		 eth_hdr->dst_addr.addr_bytes[0], eth_hdr->dst_addr.addr_bytes[1],
+		 eth_hdr->dst_addr.addr_bytes[2], eth_hdr->dst_addr.addr_bytes[3],
+		 eth_hdr->dst_addr.addr_bytes[4], eth_hdr->dst_addr.addr_bytes[5]);
+
+	if (RTE_ETH_IS_IPV4_HDR(pkt->packet_type)) {
+		ipv4_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+		src_ip = rte_be_to_cpu_32(ipv4_hdr->src_addr);
+		dst_ip = rte_be_to_cpu_32(ipv4_hdr->dst_addr);
+		proto = ipv4_hdr->next_proto_id;
+
+		/* Convert IPs to string format */
+		struct in_addr addr;
+		addr.s_addr = rte_cpu_to_be_32(src_ip);
+		inet_ntop(AF_INET, &addr, src_ip_str, INET_ADDRSTRLEN);
+		addr.s_addr = rte_cpu_to_be_32(dst_ip);
+		inet_ntop(AF_INET, &addr, dst_ip_str, INET_ADDRSTRLEN);
+
+		/* Extract port numbers for TCP/UDP */
+		if (proto == IPPROTO_TCP && rte_pktmbuf_data_len(pkt) >= sizeof(*eth_hdr) + sizeof(*ipv4_hdr) + sizeof(*tcp_hdr)) {
+			tcp_hdr = (struct rte_tcp_hdr *)((char *)ipv4_hdr + sizeof(*ipv4_hdr));
+			src_port = rte_be_to_cpu_16(tcp_hdr->src_port);
+			dst_port = rte_be_to_cpu_16(tcp_hdr->dst_port);
+			AK_DEBUG_LOG_L3FWD("[%s] lcore=%u queue=%u TCP %s:%u -> %s:%u (MAC %s -> %s) (RSS=0x%08x)",
+				direction, lcore_id, queue_id, src_ip_str, src_port, dst_ip_str, dst_port, src_mac_str, dst_mac_str, pkt->hash.rss);
+		} else if (proto == IPPROTO_UDP && rte_pktmbuf_data_len(pkt) >= sizeof(*eth_hdr) + sizeof(*ipv4_hdr) + sizeof(*udp_hdr)) {
+			udp_hdr = (struct rte_udp_hdr *)((char *)ipv4_hdr + sizeof(*ipv4_hdr));
+			src_port = rte_be_to_cpu_16(udp_hdr->src_port);
+			dst_port = rte_be_to_cpu_16(udp_hdr->dst_port);
+			AK_DEBUG_LOG_L3FWD("[%s] lcore=%u queue=%u UDP %s:%u -> %s:%u (MAC %s -> %s) (RSS=0x%08x)",
+				direction, lcore_id, queue_id, src_ip_str, src_port, dst_ip_str, dst_port, src_mac_str, dst_mac_str, pkt->hash.rss);
+		} else {
+			AK_DEBUG_LOG_L3FWD("[%s] lcore=%u queue=%u IP proto=%u %s -> %s (MAC %s -> %s) (RSS=0x%08x)",
+				direction, lcore_id, queue_id, proto, src_ip_str, dst_ip_str, src_mac_str, dst_mac_str, pkt->hash.rss);
+		}
+	} else if (RTE_ETH_IS_IPV6_HDR(pkt->packet_type)) {
+		AK_DEBUG_LOG_L3FWD("[%s] lcore=%u queue=%u IPv6 packet (MAC %s -> %s)", direction, lcore_id, queue_id, src_mac_str, dst_mac_str);
+	} else {
+		AK_DEBUG_LOG_L3FWD("[%s] lcore=%u queue=%u Non-IP packet (type=0x%04x) (MAC %s -> %s)",
+			direction, lcore_id, queue_id, rte_be_to_cpu_16(eth_hdr->ether_type), src_mac_str, dst_mac_str);
+	}
+}
+#endif
+
+/* Print packet statistics when exiting */
+static void
+print_packet_stats(void)
+{
+	unsigned int lcore_id;
+	uint64_t total_rx = 0, total_tx = 0;
+	uint64_t current_time = rte_rdtsc();
+	uint64_t tsc_hz = rte_get_tsc_hz();
+
+	printf("\n");
+	printf("=====================================\n");
+	printf("L3FWD Packet Statistics Summary\n");
+	printf("=====================================\n");
+	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
+		"Lcore", "RX Packets", "TX Packets", "RX Rate", "TX Rate", "Loss%");
+	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
+		"-----", "----------", "----------", "--------", "--------", "------");
+
+	uint64_t total_dropped_invalid_ipv4 = 0, total_dropped_no_route = 0;
+	uint64_t total_dropped_tx_failed = 0, total_dropped_non_ip = 0, total_dropped_unknown = 0;
+
+	RTE_LCORE_FOREACH(lcore_id) {
+		if (lcore_stats[lcore_id].start_time > 0) {
+			uint64_t duration = current_time - lcore_stats[lcore_id].start_time;
+			double elapsed_sec = (double)duration / tsc_hz;
+			double rx_rate = elapsed_sec > 0 ? lcore_stats[lcore_id].filtered_rx_packets / elapsed_sec : 0;
+			double tx_rate = elapsed_sec > 0 ? lcore_stats[lcore_id].filtered_tx_packets / elapsed_sec : 0;
+			double loss_rate = lcore_stats[lcore_id].filtered_rx_packets > 0 ?
+				(double)(lcore_stats[lcore_id].filtered_rx_packets - lcore_stats[lcore_id].filtered_tx_packets) * 100.0 / lcore_stats[lcore_id].filtered_rx_packets : 0.0;
+
+			printf("%-8u %-12" PRIu64 " %-12" PRIu64 " %-10.1f %-10.1f %-8.1f\n",
+				lcore_id,
+				lcore_stats[lcore_id].filtered_rx_packets,
+				lcore_stats[lcore_id].filtered_tx_packets,
+				rx_rate / 1000000.0,  /* Convert to Mpps */
+				tx_rate / 1000000.0,
+				loss_rate);
+
+			total_rx += lcore_stats[lcore_id].filtered_rx_packets;
+			total_tx += lcore_stats[lcore_id].filtered_tx_packets;
+			total_dropped_invalid_ipv4 += lcore_stats[lcore_id].dropped_invalid_ipv4;
+			total_dropped_no_route += lcore_stats[lcore_id].dropped_no_route;
+			total_dropped_tx_failed += lcore_stats[lcore_id].dropped_tx_failed;
+			total_dropped_non_ip += lcore_stats[lcore_id].dropped_non_ip;
+			total_dropped_unknown += lcore_stats[lcore_id].dropped_unknown;
+		}
+	}
+
+	/* Calculate total excluded packets (unwanted traffic like DHCP) */
+	uint64_t total_raw_rx = 0, total_raw_tx = 0, total_excluded_rx = 0, total_excluded_tx = 0;
+	RTE_LCORE_FOREACH(lcore_id) {
+		if (lcore_stats[lcore_id].start_time > 0) {
+			total_raw_rx += lcore_stats[lcore_id].rx_packets;
+			total_raw_tx += lcore_stats[lcore_id].tx_packets;
+		}
+	}
+	total_excluded_rx = total_raw_rx - total_rx;
+	total_excluded_tx = total_raw_tx - total_tx;
+
+	double total_loss_rate = total_rx > 0 ? (double)(total_rx - total_tx) * 100.0 / total_rx : 0.0;
+
+	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
+		"-----", "----------", "----------", "--------", "--------", "------");
+	printf("%-8s %-12" PRIu64 " %-12" PRIu64 " %-10s %-10s %-8.1f\n",
+		"Total", total_rx, total_tx, "", "", total_loss_rate);
+	printf("=====================================\n");
+	printf("ANALYSIS: RX/TX difference = %" PRIu64 " packets (%.1f%% loss)\n",
+		total_rx - total_tx, total_loss_rate);
+
+	printf("FILTERING: %" PRIu64 " RX + %" PRIu64 " TX unwanted packets excluded from counting\n\n\n",
+		total_excluded_rx, total_excluded_tx);
+	// if (total_raw_rx > 0 && total_raw_tx > 0) {
+	// 	printf("           (%.1f%% of total RX, %.1f%% of total TX)\n",
+	// 		(double)total_excluded_rx * 100.0 / total_raw_rx,
+	// 		(double)total_excluded_tx * 100.0 / total_raw_tx);
+	// }
+
+
+	/* Print detailed drop analysis */
+	if (total_rx - total_tx > 0) {
+		printf("DROP ANALYSIS:\n");
+		printf("  Invalid IPv4 packets: %" PRIu64 "\n", total_dropped_invalid_ipv4);
+		printf("  No route found: %" PRIu64 "\n", total_dropped_no_route);
+		printf("  TX failed (queue full): %" PRIu64 " (%.1f%% of RX)\n",
+			total_dropped_tx_failed, total_rx > 0 ? (double)total_dropped_tx_failed * 100.0 / total_rx : 0.0);
+		printf("  Non-IP packets: %" PRIu64 "\n", total_dropped_non_ip);
+		printf("  Unknown drops: %" PRIu64 "\n", total_dropped_unknown);
+
+		if (total_dropped_tx_failed > 0) {
+			printf("\nTX CONGESTION ANALYSIS:\n");
+			printf("  - TX queue is overloaded (receiving faster than transmitting)\n");
+			printf("  - Consider: reducing RX rate, increasing TX queue size, or checking network bottleneck\n");
+		}
+	}
+
+	/* Always show CURRENT CONFIGURATION when stats are enabled */
+	if (stats_enabled) {
+		printf("\nCURRENT CONFIGURATION:\n");
+		printf("  RX_DESC_DEFAULT (nb_rxd): %u \n", nb_rxd);
+		printf("  TX_DESC_DEFAULT (nb_txd): %u \n", nb_txd);
+		printf("  MAX_PKT_BURST: %u\n", MAX_PKT_BURST);
+		printf("  DEFAULT_PKT_BURST: %u (actual nb_pkt_per_burst: %u)\n", DEFAULT_PKT_BURST, nb_pkt_per_burst);
+		printf("  BURST_TX_DRAIN_US: %u us\n", BURST_TX_DRAIN_US);
+		printf("  MAX_TX_BURST: %u\n", MAX_TX_BURST);
+		printf("  enabled_port_mask: 0x%x\n", enabled_port_mask);
+
+		/* Get port info for first enabled port */
+		uint16_t portid;
+		for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+			if ((enabled_port_mask & (1 << portid)) != 0) {
+				struct rte_eth_dev_info dev_info;
+				struct rte_eth_link link;
+				if (rte_eth_dev_info_get(portid, &dev_info) == 0) {
+					printf("  Port %u driver_name: %s\n", portid, dev_info.driver_name);
+					printf("  Port %u max_tx_queues: %u\n", portid, dev_info.max_tx_queues);
+					printf("  Port %u max_rx_queues: %u\n", portid, dev_info.max_rx_queues);
+				}
+				if (rte_eth_link_get_nowait(portid, &link) == 0) {
+					printf("  Port %u link_speed: %u Mbps, %s\n", portid, link.link_speed,
+						link.link_status ? "UP" : "DOWN");
+				}
+				break; /* Only show first enabled port */
+			}
+		}
+	}
+	printf("=====================================\n");
+
+	print_all_nic_hw_stats();
+
+	/* Print PCM performance statistics if available */
+	if (stats_enabled && pcm_monitoring_is_available()) {
+		/* Stop measurement period FIRST to capture final state */
+		pcm_monitoring_stop_all();
+
+		/* Then collect and calculate statistics immediately */
+		pcm_monitoring_measure_all();
+
+		/* Print comprehensive PCM statistics */
+		pcm_print_core_statistics();
+		pcm_print_memory_statistics();
+		pcm_print_io_statistics();
+		pcm_print_system_statistics();
+	}
+}
+
+/* Signal handler for graceful shutdown */
+static void
+signal_handler(int signum)
+{
+	if (signum == SIGINT || signum == SIGTERM) {
+		printf("\nReceived signal %d, shutting down...\n", signum);
+		if (stats_enabled) {
+			print_packet_stats();
+		}
+		stats_enabled = false;
+		force_quit = true;
+	}
+}
 
 /* Performing LPM-based lookups. 8< */
 static inline uint16_t
@@ -156,6 +418,19 @@ lpm_main_loop(__rte_unused void *dummy)
 	lcore_id = rte_lcore_id();
 	qconf = &lcore_conf[lcore_id];
 
+	/* Initialize packet statistics for this lcore */
+	lcore_stats[lcore_id].rx_packets = 0;
+	lcore_stats[lcore_id].tx_packets = 0;
+	lcore_stats[lcore_id].filtered_rx_packets = 0;
+	lcore_stats[lcore_id].filtered_tx_packets = 0;
+	lcore_stats[lcore_id].start_time = rte_rdtsc();
+
+	/* Install signal handlers only on master lcore */
+	if (rte_lcore_id() == rte_get_main_lcore()) {
+		signal(SIGINT, signal_handler);
+		signal(SIGTERM, signal_handler);
+	}
+
 	const uint16_t n_rx_q = qconf->n_rx_queue;
 	const uint16_t n_tx_p = qconf->n_tx_port;
 	if (n_rx_q == 0) {
@@ -163,15 +438,29 @@ lpm_main_loop(__rte_unused void *dummy)
 		return 0;
 	}
 
-	RTE_LOG(INFO, L3FWD, "entering main loop on lcore %u\n", lcore_id);
-
+	RTE_LOG(INFO, L3FWD, "[lpm] entering main loop on lcore %u\n", lcore_id);
 	for (i = 0; i < n_rx_q; i++) {
-
 		portid = qconf->rx_queue_list[i].port_id;
 		queueid = qconf->rx_queue_list[i].queue_id;
 		RTE_LOG(INFO, L3FWD,
-			" -- lcoreid=%u portid=%u rxqueueid=%" PRIu16 "\n",
+			" [RX] lcoreid=%u, port=%u rxq=%hhu\n",
 			lcore_id, portid, queueid);
+	}
+
+	for (i = 0; i < n_tx_p; i++) {
+		portid = qconf->tx_port_id[i];
+		RTE_LOG(INFO, L3FWD,
+			" [TX] lcoreid=%u, port=%u, txq=%hhu\n",
+			lcore_id, portid, qconf->tx_queue_id[portid]);
+	}
+
+	for (i = 0; i < n_rx_q; i++) {
+		portid = qconf->rx_queue_list[i].port_id;
+		queueid = qconf->rx_queue_list[i].queue_id;
+		uint16_t tx_queueid = qconf->tx_queue_id[portid];
+		RTE_LOG(INFO, L3FWD,
+			" -- lcoreid=%u portid=%u rxqueueid=%" PRIu16 " txqueueid=%" PRIu16 "\n",
+			lcore_id, portid, queueid, tx_queueid);
 	}
 
 	cur_tsc = rte_rdtsc();
@@ -189,6 +478,9 @@ lpm_main_loop(__rte_unused void *dummy)
 				portid = qconf->tx_port_id[i];
 				if (qconf->tx_mbufs[portid].len == 0)
 					continue;
+
+				AK_DEBUG_LOG_L3FWD("lcore %u sending %u packets to port %u queue %u",
+					lcore_id, qconf->tx_mbufs[portid].len, portid, qconf->tx_queue_id[portid]);
 				send_burst(qconf,
 					qconf->tx_mbufs[portid].len,
 					portid);
@@ -209,6 +501,34 @@ lpm_main_loop(__rte_unused void *dummy)
 			if (nb_rx == 0)
 				continue;
 
+			/* Update RX packet statistics with filtering */
+			if (stats_enabled) {
+				uint64_t filtered_count = 0;
+
+				/* Single iteration through all received packets */
+				for (int j = 0; j < nb_rx; j++) {
+					/* Filter out unwanted packets (DHCP etc.) for statistics */
+					if (!is_dhcp_packet(pkts_burst[j])) {
+						filtered_count++;
+					}
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+					/* Analyze packet for debugging */
+					analyze_packet(pkts_burst[j], lcore_id, "RX", queueid);
+#endif
+				}
+
+				lcore_stats[lcore_id].rx_packets += nb_rx;
+				lcore_stats[lcore_id].filtered_rx_packets += filtered_count;
+			} else {
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+				/* Analyze packets for debugging even when stats disabled */
+				for (int j = 0; j < nb_rx; j++) {
+					analyze_packet(pkts_burst[j], lcore_id, "RX", queueid);
+				}
+#endif
+			}
+
+			AK_DEBUG_LOG_L3FWD("lcore %u received %d packets from port %u queue %u", lcore_id, nb_rx, portid, queueid);
 #if defined RTE_ARCH_X86 || defined __ARM_NEON \
 			 || defined RTE_ARCH_PPC_64
 			l3fwd_lpm_send_packets(nb_rx, pkts_burst,
@@ -220,6 +540,11 @@ lpm_main_loop(__rte_unused void *dummy)
 		}
 
 		cur_tsc = rte_rdtsc();
+	}
+
+	/* Print statistics when main loop exits */
+	if (rte_lcore_id() == rte_get_main_lcore() && stats_enabled) {
+		print_packet_stats();
 	}
 
 	return 0;

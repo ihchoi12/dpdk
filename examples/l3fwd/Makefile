@@ -7,6 +7,7 @@ APP = l3fwd
 # all source are stored in SRCS-y
 SRCS-y := main.c l3fwd_acl.c l3fwd_lpm.c l3fwd_fib.c l3fwd_em.c l3fwd_event.c
 SRCS-y += l3fwd_event_generic.c l3fwd_event_internal_port.c
+SRCS-y += l3fwd_pcm.c ../../../common/pcm/common_pcm_wrapper.cpp
 
 PKGCONF ?= pkg-config
 
@@ -26,8 +27,13 @@ PC_FILE := $(shell $(PKGCONF) --path libdpdk 2>/dev/null)
 CFLAGS += -O3 $(shell $(PKGCONF) --cflags libdpdk)
 # Added for 'rte_eth_link_to_str()'
 CFLAGS += -DALLOW_EXPERIMENTAL_API
+# PCM include paths (Intel PCM and common wrapper)
+CFLAGS += -I../../../pcm/src -I../../../common/pcm
 LDFLAGS_SHARED = $(shell $(PKGCONF) --libs libdpdk)
 LDFLAGS_STATIC = $(shell $(PKGCONF) --static --libs libdpdk)
+# PCM library linking
+LDFLAGS_SHARED += -L../../../pcm/build/lib -lpcm -lstdc++
+LDFLAGS_STATIC += -L../../../pcm/build/lib -lpcm -lstdc++
 
 CFLAGS += -I../common
 

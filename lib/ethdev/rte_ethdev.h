@@ -159,6 +159,7 @@
 #include <rte_cman.h>
 #include <rte_compat.h>
 #include <rte_log.h>
+#include "../../../ak_debug_log.h"
 #include <rte_interrupts.h>
 #include <rte_dev.h>
 #include <rte_devargs.h>
@@ -6686,14 +6687,15 @@ rte_eth_tx_burst(uint16_t port_id, uint16_t queue_id,
 		 */
 		cb = rte_atomic_load_explicit(&p->txq.clbk[queue_id],
 				rte_memory_order_relaxed);
-		if (unlikely(cb != NULL))
+		if (unlikely(cb != NULL)){
+			AK_DEBUG_LOG_LINE(INFO, "rte_eth_call_tx_callbacks()");
 			nb_pkts = rte_eth_call_tx_callbacks(port_id, queue_id,
 					tx_pkts, nb_pkts, cb);
+		}
 	}
 #endif
-
+	AK_DEBUG_LOG_LINE(INFO, "p->tx_pkt_burst()");
 	nb_pkts = p->tx_pkt_burst(qd, tx_pkts, nb_pkts);
-
 	rte_ethdev_trace_tx_burst(port_id, queue_id, (void **)tx_pkts, nb_pkts);
 	return nb_pkts;
 }

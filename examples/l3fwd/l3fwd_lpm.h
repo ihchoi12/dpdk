@@ -12,6 +12,7 @@ l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ipv4_hdr;
 	uint16_t dst_port;
+	unsigned int lcore_id = rte_lcore_id();
 
 	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
 
@@ -23,6 +24,7 @@ l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
 #ifdef DO_RFC_1812_CHECKS
 		/* Check to make sure the packet is valid (RFC1812) */
 		if (is_valid_ipv4_pkt(ipv4_hdr, m->pkt_len, m->ol_flags) < 0) {
+			lcore_stats[lcore_id].dropped_invalid_ipv4++;
 			rte_pktmbuf_free(m);
 			return;
 		}
@@ -31,8 +33,11 @@ l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
 						qconf->ipv4_lookup_struct);
 
 		if (dst_port >= RTE_MAX_ETHPORTS ||
-			(enabled_port_mask & 1 << dst_port) == 0)
-			dst_port = portid;
+			(enabled_port_mask & 1 << dst_port) == 0) {
+			lcore_stats[lcore_id].dropped_no_route++;
+			rte_pktmbuf_free(m);
+			return;
+		}
 
 #ifdef DO_RFC_1812_CHECKS
 		/* Update time to live and header checksum */
@@ -58,8 +63,11 @@ l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
 					qconf->ipv6_lookup_struct);
 
 		if (dst_port >= RTE_MAX_ETHPORTS ||
-			(enabled_port_mask & 1 << dst_port) == 0)
-			dst_port = portid;
+			(enabled_port_mask & 1 << dst_port) == 0) {
+			lcore_stats[lcore_id].dropped_no_route++;
+			rte_pktmbuf_free(m);
+			return;
+		}
 
 		/* dst addr */
 		*(uint64_t *)&eth_hdr->dst_addr = dest_eth_addr[dst_port];
@@ -71,6 +79,7 @@ l3fwd_lpm_simple_forward(struct rte_mbuf *m, uint16_t portid,
 		send_single_packet(qconf, m, dst_port);
 	} else {
 		/* Free the mbuf that contains non-IPV4/IPV6 packet */
+		lcore_stats[lcore_id].dropped_non_ip++;
 		rte_pktmbuf_free(m);
 	}
 }

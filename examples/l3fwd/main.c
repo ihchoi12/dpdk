@@ -48,6 +48,7 @@
 #include "l3fwd.h"
 #include "l3fwd_event.h"
 #include "l3fwd_route.h"
+#include "l3fwd_pcm.h"
 
 #define MAX_TX_QUEUE_PER_PORT RTE_MAX_LCORE
 #define MAX_RX_QUEUE_PER_PORT 128
@@ -131,7 +132,8 @@ static struct rte_eth_conf port_conf = {
 	.rx_adv_conf = {
 		.rss_conf = {
 			.rss_key = NULL,
-			.rss_hf = RTE_ETH_RSS_IP,
+			// .rss_hf = RTE_ETH_RSS_IP,
+			.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP,
 		},
 	},
 	.txmode = {
@@ -1065,10 +1067,11 @@ parse_args(int argc, char **argv)
 	}
 
 	/* For ACL, update port config rss hash filter */
-	if (lookup_mode == L3FWD_LOOKUP_ACL) {
-		port_conf.rx_adv_conf.rss_conf.rss_hf |=
-				RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_SCTP;
-	}
+	// if (lookup_mode == L3FWD_LOOKUP_ACL) {
+	// 	port_conf.rx_adv_conf.rss_conf.rss_hf |=
+	// 			RTE_ETH_RSS_UDP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_SCTP;
+	// }
+	/* RSS hash filter now includes TCP/UDP ports for all modes */
 
 	if (optind >= 0)
 		argv[optind-1] = prgname;
@@ -1230,12 +1233,172 @@ check_all_ports_link_status(uint32_t port_mask)
 	}
 }
 
+/**
+ * print_nic_hw_stats - Print NIC hardware statistics for a specific port
+ *
+ * DESCRIPTION
+ * Print detailed NIC hardware statistics including drops, errors, and buffer states
+ *
+ * RETURNS: N/A
+ */
+static void
+print_nic_hw_stats(uint16_t port_id)
+{
+    struct rte_eth_stats eth_stats;
+    struct rte_eth_xstat *xstats = NULL;
+    struct rte_eth_xstat_name *xstat_names = NULL;
+    int cnt_xstats, ret, i;
+
+    printf("\n=== NIC Hardware Statistics (Port %u) ===\n", port_id);
+
+    /* Get basic ethernet statistics */
+    ret = rte_eth_stats_get(port_id, &eth_stats);
+    if (ret == 0) {
+        printf("Hardware RX Packets:     %"PRIu64"\n", eth_stats.ipackets);
+        printf("Hardware TX Packets:     %"PRIu64"\n", eth_stats.opackets);
+        printf("Hardware RX Bytes:       %"PRIu64"\n", eth_stats.ibytes);
+        printf("Hardware TX Bytes:       %"PRIu64"\n", eth_stats.obytes);
+        printf("Hardware RX Errors:      %"PRIu64"\n", eth_stats.ierrors);
+        printf("Hardware TX Errors:      %"PRIu64"\n", eth_stats.oerrors);
+        printf("Hardware RX Missed:      %"PRIu64" (packets dropped by HW)\n", eth_stats.imissed);
+        printf("Hardware RX No MBuf:     %"PRIu64" (mbuf allocation failed)\n", eth_stats.rx_nombuf);
+
+        /* Print per-queue statistics if available */
+        bool has_queue_stats = false;
+        for (i = 0; i < RTE_ETHDEV_QUEUE_STAT_CNTRS && i < 8; i++) {
+            if (eth_stats.q_ipackets[i] > 0 || eth_stats.q_opackets[i] > 0 || eth_stats.q_errors[i] > 0) {
+                if (!has_queue_stats) {
+                    printf("\nPer-Queue Statistics:\n");
+                    has_queue_stats = true;
+                }
+                printf("  Queue %d: RX=%"PRIu64", TX=%"PRIu64", Errors=%"PRIu64"\n",
+                    i, eth_stats.q_ipackets[i], eth_stats.q_opackets[i], eth_stats.q_errors[i]);
+            }
+        }
+
+        /* Calculate packet loss if any */
+        if (eth_stats.ipackets > 0) {
+            uint64_t total_drops = eth_stats.imissed + eth_stats.rx_nombuf + eth_stats.ierrors;
+            if (total_drops > 0) {
+                double drop_rate = (double)total_drops * 100.0 / (eth_stats.ipackets + total_drops);
+                printf("\nPacket Loss Analysis:\n");
+                printf("  Total Drops:           %"PRIu64"\n", total_drops);
+                printf("  Drop Rate:             %.2f%%\n", drop_rate);
+                printf("  Primary Drop Cause:    ");
+                if (eth_stats.imissed > eth_stats.rx_nombuf && eth_stats.imissed > eth_stats.ierrors) {
+                    printf("HW Ring Full (imissed)\n");
+                } else if (eth_stats.rx_nombuf > eth_stats.ierrors) {
+                    printf("No MBuf Available\n");
+                } else if (eth_stats.ierrors > 0) {
+                    printf("HW Errors\n");
+                } else {
+                    printf("Unknown\n");
+                }
+            }
+        }
+    } else {
+        printf("Failed to get basic statistics for port %u\n", port_id);
+    }
+
+    /* Get extended statistics for detailed drop analysis */
+    cnt_xstats = rte_eth_xstats_get_names(port_id, NULL, 0);
+    if (cnt_xstats > 0) {
+        xstat_names = malloc(sizeof(struct rte_eth_xstat_name) * cnt_xstats);
+        xstats = malloc(sizeof(struct rte_eth_xstat) * cnt_xstats);
+
+        if (xstat_names && xstats) {
+            ret = rte_eth_xstats_get_names(port_id, xstat_names, cnt_xstats);
+            if (ret == cnt_xstats) {
+                ret = rte_eth_xstats_get(port_id, xstats, cnt_xstats);
+                if (ret == cnt_xstats) {
+                    printf("\nDetailed Drop/Error Statistics:\n");
+                    bool found_drops = false;
+                    for (i = 0; i < cnt_xstats; i++) {
+                        const char *name = xstat_names[i].name;
+                        uint64_t value = xstats[i].value;
+
+                        /* Filter for drop/error related statistics */
+                        if (value > 0 && (strstr(name, "drop") || strstr(name, "discard") ||
+                                         strstr(name, "error") || strstr(name, "miss") ||
+                                         strstr(name, "full") || strstr(name, "overflow") ||
+                                         strstr(name, "underrun") || strstr(name, "crc") ||
+                                         strstr(name, "fragment") || strstr(name, "jabber"))) {
+                            printf("  %-30s: %"PRIu64"\n", name, value);
+                            found_drops = true;
+                        }
+                    }
+                    if (!found_drops) {
+                        printf("  No drop/error statistics found\n");
+                    }
+                }
+            }
+        }
+
+        free(xstat_names);
+        free(xstats);
+    }
+    printf("==========================================\n");
+}
+
+/**
+ * print_all_nic_hw_stats - Print NIC hardware statistics for all enabled ports
+ *
+ * DESCRIPTION
+ * Print NIC hardware statistics for all ports currently enabled in l3fwd
+ *
+ * RETURNS: N/A
+ */
+void
+print_all_nic_hw_stats(void)
+{
+    uint16_t portid;
+
+    printf("\n########################################\n");
+    printf("# NIC HARDWARE STATISTICS ANALYSIS\n");
+    printf("########################################\n");
+
+    for (portid = 0; portid < RTE_MAX_ETHPORTS; portid++) {
+        if ((enabled_port_mask & (1 << portid)) != 0) {
+            print_nic_hw_stats(portid);
+        }
+    }
+
+    printf("########################################\n");
+}
+
 static void
 signal_handler(int signum)
 {
 	if (signum == SIGINT || signum == SIGTERM) {
 		printf("\n\nSignal %d received, preparing to exit...\n",
 				signum);
+
+		/* Print NIC hardware statistics before exit if stats are enabled */
+		if (stats_enabled) {
+			print_all_nic_hw_stats();
+		}
+
+		/* Print PCM statistics before exit */
+		if (stats_enabled && pcm_monitoring_is_available()) {
+			printf("\n\nReceived signal %d, shutting down...\n", signum);
+
+			printf("\n=== Intel PCM Performance Statistics ===\n");
+
+			/* First stop PCM monitoring to capture final state */
+			pcm_monitoring_stop_all();
+
+			/* Then measure all cores with proper before/after states */
+			pcm_monitoring_measure_all();
+
+			/* Print comprehensive PCM statistics */
+			pcm_print_core_statistics();
+			pcm_print_memory_statistics();
+			pcm_print_io_statistics();
+			pcm_print_system_statistics();
+
+			printf("=== End PCM Statistics ===\n");
+		}
+
 		force_quit = true;
 	}
 }
@@ -1340,7 +1503,7 @@ l3fwd_poll_resource_setup(void)
 		fflush(stdout);
 
 		nb_rx_queue = get_port_n_rx_queues(portid);
-		n_tx_queue = nb_lcores;
+		n_tx_queue = nb_lcores - 1; // exclude core 0
 		if (n_tx_queue > MAX_TX_QUEUE_PER_PORT)
 			n_tx_queue = MAX_TX_QUEUE_PER_PORT;
 		printf("Creating queues: nb_rxq=%d nb_txq=%u... ",
@@ -1438,7 +1601,7 @@ l3fwd_poll_resource_setup(void)
 
 		/* init one TX queue per couple (lcore,port) */
 		queueid = 0;
-		for (lcore_id = 0; lcore_id < RTE_MAX_LCORE; lcore_id++) {
+		for (lcore_id = 1; lcore_id < RTE_MAX_LCORE; lcore_id++) { // exclude code 0
 			if (rte_lcore_is_enabled(lcore_id) == 0)
 				continue;
 
@@ -1448,13 +1611,17 @@ l3fwd_poll_resource_setup(void)
 			else
 				socketid = 0;
 
-			printf("txq=%u,%d,%d ", lcore_id, queueid, socketid);
+			// printf("TXQ=%u,%d,%d ", lcore_id, queueid, socketid);
 			fflush(stdout);
 
 			txconf = &dev_info.default_txconf;
 			txconf->offloads = local_port_conf.txmode.offloads;
 			ret = rte_eth_tx_queue_setup(portid, queueid, nb_txd,
 						     socketid, txconf);
+			printf("txconf: tx_thresh={pthresh=%u, hthresh=%u, wthresh=%u}, "
+				"tx_rs_thresh=%u, tx_free_thresh=%u, offloads=0x%"PRIx64"\n",
+				txconf->tx_thresh.pthresh, txconf->tx_thresh.hthresh, txconf->tx_thresh.wthresh,
+				txconf->tx_rs_thresh, txconf->tx_free_thresh, txconf->offloads);
 			if (ret < 0)
 				rte_exit(EXIT_FAILURE,
 					"rte_eth_tx_queue_setup: err=%d, "
@@ -1474,7 +1641,7 @@ l3fwd_poll_resource_setup(void)
 		if (rte_lcore_is_enabled(lcore_id) == 0)
 			continue;
 		qconf = &lcore_conf[lcore_id];
-		printf("\nInitializing rx queues on lcore %u ... ", lcore_id );
+		// printf("\nInitializing rx queues on lcore %u ... ", lcore_id );
 		fflush(stdout);
 		/* init RX queues */
 		for(queue = 0; queue < qconf->n_rx_queue; ++queue) {
@@ -1490,7 +1657,7 @@ l3fwd_poll_resource_setup(void)
 			else
 				socketid = 0;
 
-			printf("rxq=%d,%d,%d ", portid, queueid, socketid);
+			// printf("rxq=%d,%d,%d ", portid, queueid, socketid);
 			fflush(stdout);
 
 			ret = rte_eth_dev_info_get(portid, &dev_info);
@@ -1635,6 +1802,14 @@ main(int argc, char **argv)
 	argc -= ret;
 	argv += ret;
 
+	/* Initialize PCM monitoring early */
+	printf("=== Initializing Intel PCM Performance Monitoring ===\n");
+	if (pcm_monitoring_init() == 0) {
+		printf("=== Intel PCM initialized successfully ===\n");
+	} else {
+		printf("=== Intel PCM initialization failed, continuing without PCM ===\n");
+	}
+
 	force_quit = false;
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
@@ -1727,6 +1902,17 @@ main(int argc, char **argv)
 	check_all_ports_link_status(enabled_port_mask);
 
 	ret = 0;
+
+	/* Start PCM monitoring on all lcores before launching main loops */
+	if (stats_enabled && pcm_monitoring_is_available()) {
+		printf("Starting PCM monitoring on all lcores...\n");
+		if (pcm_monitoring_start_all() == 0) {
+			printf("PCM monitoring started successfully\n");
+		} else {
+			printf("Failed to start PCM monitoring\n");
+		}
+	}
+
 	/* launch per-lcore init on every lcore */
 	rte_eal_mp_remote_launch(l3fwd_lkp.main_loop, NULL, CALL_MAIN);
 

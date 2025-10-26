@@ -516,6 +516,13 @@ RTE_INIT(__##type)							    \
 	RTE_LOG_REGISTER_IMPL(type,					      \
 		 RTE_STR(RTE_LOG_DEFAULT_LOGTYPE) "." RTE_STR(suffix), level)
 
+/* Include unified Autokernel debug logging system */
+#include "../../../ak_debug_log.h"
+
+/* Backward compatibility: map old RTE_DEBUG_LOG* to new AK_DEBUG_LOG* */
+#define RTE_DEBUG_LOG(level, logtype, ...) AK_DEBUG_LOG(level, logtype, __VA_ARGS__)
+#define RTE_DEBUG_LOG_LINE(level, ...) AK_DEBUG_LOG_LINE(level, __VA_ARGS__)
+
 #ifdef __cplusplus
 }
 #endif

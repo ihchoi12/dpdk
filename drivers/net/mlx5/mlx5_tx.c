@@ -162,6 +162,8 @@ mlx5_tx_comp_flush(struct mlx5_txq_data *__rte_restrict txq,
 			mlx5_tx_free_elts(txq, tail, olx);
 			MLX5_ASSERT(tail == txq->elts_tail);
 		}
+		AK_DEBUG_LOG_LINE(INFO, "Flushed TX buffers up to elts_tail=%u, elts_head=%u, wqe_pi=%u",
+				  txq->elts_tail, txq->elts_head, txq->wqe_pi);
 	}
 }
 
@@ -225,6 +227,9 @@ mlx5_tx_handle_completion(struct mlx5_txq_data *__rte_restrict txq,
 			++txq->cq_ci;
 			txq->cq_pi = txq->cq_ci;
 			last_cqe = NULL;
+
+			AK_DEBUG_LOG_LINE(INFO, "Some error happend in CQE handling => reset cq_ci=%u cq_pi=%u",
+					  txq->cq_ci, txq->cq_pi);
 			continue;
 		}
 		/* Normal transmit completion. */
@@ -245,6 +250,8 @@ mlx5_tx_handle_completion(struct mlx5_txq_data *__rte_restrict txq,
 		ring_doorbell = true;
 		++txq->cq_ci;
 		last_cqe = cqe;
+		AK_DEBUG_LOG_LINE(INFO, "Handled 1 CQE => cq_ci=%u cq_pi=%u",
+					  txq->cq_ci, txq->cq_pi);
 		/*
 		 * We have to restrict the amount of processed CQEs
 		 * in one tx_burst routine call. The CQ may be large
@@ -260,6 +267,7 @@ mlx5_tx_handle_completion(struct mlx5_txq_data *__rte_restrict txq,
 		rte_compiler_barrier();
 		*txq->cq_db = rte_cpu_to_be_32(txq->cq_ci);
 		mlx5_tx_comp_flush(txq, last_cqe, olx);
+		AK_DEBUG_LOG_LINE(INFO, "Doorbell NIC for cq_ci %u", txq->cq_ci);
 	}
 }
 

@@ -5,9 +5,15 @@
 #ifndef __L3_FWD_H__
 #define __L3_FWD_H__
 
+#include <stdlib.h>
 #include <rte_ethdev.h>
 #include <rte_vect.h>
 #include <rte_acl.h>
+
+/* Include unified debug logging system */
+#include "../../../ak_debug_log.h"
+
+static volatile bool stats_enabled = true;
 
 #define DO_RFC_1812_CHECKS
 
@@ -110,6 +116,9 @@ extern xmm_t val_eth[RTE_MAX_ETHPORTS];
 
 extern struct lcore_conf lcore_conf[RTE_MAX_LCORE];
 
+/* NIC hardware statistics functions */
+void print_all_nic_hw_stats(void);
+
 extern struct parm_cfg parm_config;
 
 extern struct acl_algorithms acl_alg[];
@@ -119,6 +128,29 @@ extern uint32_t max_pkt_len;
 extern uint32_t nb_pkt_per_burst;
 extern uint32_t mb_mempool_cache_size;
 
+/* Packet statistics per lcore */
+struct lcore_packet_stats {
+	uint64_t rx_packets;
+	uint64_t tx_packets;
+	uint64_t filtered_rx_packets;   /* RX packets excluding unwanted traffic like DHCP */
+	uint64_t filtered_tx_packets;   /* TX packets excluding unwanted traffic like DHCP */
+	uint64_t start_time;
+	/* Drop counters */
+	uint64_t dropped_invalid_ipv4;
+	uint64_t dropped_no_route;
+	uint64_t dropped_tx_failed;
+	uint64_t dropped_non_ip;
+	uint64_t dropped_unknown;
+};
+
+extern struct lcore_packet_stats lcore_stats[RTE_MAX_LCORE];
+
+/* Function declarations */
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+void analyze_packet(struct rte_mbuf *pkt, unsigned int lcore_id, const char *direction, uint16_t queue_id);
+#endif
+int is_dhcp_packet(struct rte_mbuf *pkt);
+
 /* Send burst of packets on an output interface */
 static inline int
 send_burst(struct lcore_conf *qconf, uint16_t n, uint16_t port)
@@ -126,12 +158,52 @@ send_burst(struct lcore_conf *qconf, uint16_t n, uint16_t port)
 	struct rte_mbuf **m_table;
 	int ret;
 	uint16_t queueid;
+	unsigned int lcore_id = rte_lcore_id();
 
 	queueid = qconf->tx_queue_id[port];
 	m_table = (struct rte_mbuf **)qconf->tx_mbufs[port].m_table;
 
 	ret = rte_eth_tx_burst(port, queueid, m_table, n);
+
+	/* Single iteration through successfully transmitted packets */
+	if (stats_enabled) {
+		uint64_t filtered_count = 0;
+
+		for (int i = 0; i < ret; i++) {
+			/* Filter out unwanted packets (DHCP etc.) for statistics */
+			if (!is_dhcp_packet(m_table[i])) {
+				filtered_count++;
+			}
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+			/* Analyze packet for debugging using unified system */
+			AK_DEBUG_LOG_L3FWD("TX packet analysis on lcore %u, queue %u", lcore_id, queueid);
+			analyze_packet(m_table[i], lcore_id, "TX", queueid);
+#endif
+		}
+
+		lcore_stats[lcore_id].tx_packets += ret;
+		lcore_stats[lcore_id].filtered_tx_packets += filtered_count;
+	} else {
+		lcore_stats[lcore_id].tx_packets += ret;
+#ifdef RTE_LIBRTE_ETHDEV_DEBUG
+		/* Analyze packets for debugging even when stats disabled */
+		for (int i = 0; i < ret; i++) {
+			AK_DEBUG_LOG_L3FWD("TX packet analysis (stats disabled) on lcore %u, queue %u", lcore_id, queueid);
+			analyze_packet(m_table[i], lcore_id, "TX", queueid);
+		}
+#endif
+	}
+
 	if (unlikely(ret < n)) {
+		/* Count failed TX packets */
+		lcore_stats[lcore_id].dropped_tx_failed += (n - ret);
+
+		/* Log TX congestion for debugging */
+		if (lcore_stats[lcore_id].dropped_tx_failed % 1000 == 0) {
+			AK_DEBUG_LOG_L3FWD("TX congestion on port %u: tried %u, sent %d, failed %u (total failed: %" PRIu64 ")",
+				port, n, ret, (n - ret), lcore_stats[lcore_id].dropped_tx_failed);
+		}
+
 		do {
 			rte_pktmbuf_free(m_table[ret]);
 		} while (++ret < n);
