@@ -27,6 +27,88 @@
 #include "mlx5_rxtx.h"
 #include "mlx5_tx.h"
 
+#ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
+#include <stdio.h>
+
+/* AK: Global per-lcore TX queue depth statistics */
+struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+static int ak_txq_initialized = 0;
+
+/* Forward declaration */
+static void ak_txq_depth_report(void);
+
+/**
+ * AK: Initialize per-core TX queue depth tracking
+ * Called automatically via constructor attribute
+ */
+__attribute__((constructor))
+static void
+ak_txq_depth_init(void)
+{
+	if (ak_txq_initialized)
+		return;
+
+	memset(ak_txq_stats, 0, sizeof(ak_txq_stats));
+	ak_txq_initialized = 1;
+	printf("AK: TX queue depth tracking initialized for %d lcores\n", AK_MAX_LCORES);
+
+	/* Register destructor for reporting on exit */
+	atexit(ak_txq_depth_report);
+}
+
+/**
+ * AK: Report per-core average TX queue depth
+ */
+static void
+ak_txq_depth_report(void)
+{
+	int lcore_id;
+	int active_lcores = 0;
+	uint64_t total_samples = 0;
+	uint64_t total_depth_sum = 0;
+
+	printf("\n");
+	printf("=====================================\n");
+	printf("AK: Per-Core TX Queue Depth Report\n");
+	printf("=====================================\n");
+	printf("Lcore    Samples      Total Depth  Avg Depth\n");
+	printf("-----    ----------   -----------  ---------\n");
+
+	for (lcore_id = 0; lcore_id < AK_MAX_LCORES; lcore_id++) {
+		struct ak_txq_depth_stats *stats = &ak_txq_stats[lcore_id];
+
+		if (stats->sample_count == 0)
+			continue;
+
+		double avg_depth = (double)stats->total_depth / stats->sample_count;
+
+		printf("%-5d    %-10lu   %-11lu  %.2f\n",
+			lcore_id,
+			stats->sample_count,
+			stats->total_depth,
+			avg_depth);
+
+		active_lcores++;
+		total_samples += stats->sample_count;
+		total_depth_sum += stats->total_depth;
+	}
+
+	printf("-----    ----------   -----------  ---------\n");
+
+	if (total_samples > 0) {
+		double overall_avg = (double)total_depth_sum / total_samples;
+		printf("Total    %-10lu   %-11lu  %.2f\n",
+			total_samples,
+			total_depth_sum,
+			overall_avg);
+	}
+
+	printf("\nActive lcores: %d\n", active_lcores);
+	printf("=====================================\n");
+	printf("\n");
+}
+#endif /* AK_ENABLE_QUEUE_DEPTH_TRACKING */
+
 #define MLX5_TXOFF_INFO(func, olx) {mlx5_tx_burst_##func, olx},
 
 /**

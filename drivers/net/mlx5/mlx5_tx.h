@@ -26,6 +26,21 @@
 
 /* Note: Using AK_DEBUG_LOG_LINE for unified logging with ethdev layer */
 
+#ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
+#include <rte_lcore.h>
+
+/* AK: Per-lcore TX queue depth statistics */
+#define AK_MAX_LCORES 128
+
+struct ak_txq_depth_stats {
+	uint64_t total_depth;   /* Accumulated queue depth */
+	uint64_t sample_count;  /* Number of samples */
+};
+
+/* Global per-lcore statistics array (defined in mlx5_tx.c) */
+extern struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+#endif
+
 /* TX burst subroutines return codes. */
 enum mlx5_txcmp_code {
 	MLX5_TXCMP_CODE_EXIT = 0,
@@ -3672,6 +3687,22 @@ send_loop:
 
 	AK_DEBUG_LOG_LINE(NOTICE, "MLX5 TX: Calling mlx5_tx_handle_completion");
 	mlx5_tx_handle_completion(txq, olx);
+
+#ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
+	/* AK: Per-core TX queue depth tracking (sample every 10000th call) */
+	{
+		static __thread uint64_t ak_sample_counter = 0;
+		if (++ak_sample_counter % 10000 == 0) {
+			unsigned int lcore_id = rte_lcore_id();
+			if (lcore_id < AK_MAX_LCORES) {
+				uint16_t nb_used = txq->elts_head - txq->elts_tail;
+				ak_txq_stats[lcore_id].total_depth += nb_used;
+				ak_txq_stats[lcore_id].sample_count++;
+			}
+		}
+	}
+#endif
+
 	/*
 	 * Calculate the number of available resources - elts and WQEs.
 	 * There are two possible different scenarios:
