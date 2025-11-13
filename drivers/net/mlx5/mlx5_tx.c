@@ -30,8 +30,7 @@
 #ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
 #include <stdio.h>
 
-/* AK: Global per-lcore TX queue depth statistics */
-struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+/* AK: TX queue depth statistics and target burst interval (defined in rte_ethdev.c) */
 static int ak_txq_initialized = 0;
 
 /* Forward declaration */
@@ -57,7 +56,7 @@ ak_txq_depth_init(void)
 }
 
 /**
- * AK: Report per-core average TX queue depth
+ * AK: Report per-core average TX queue depth and producer/consumer rates
  */
 static void
 ak_txq_depth_report(void)
@@ -66,13 +65,38 @@ ak_txq_depth_report(void)
 	int active_lcores = 0;
 	uint64_t total_samples = 0;
 	uint64_t total_depth_sum = 0;
+	uint64_t total_elts_depth_sum = 0;
+	uint64_t total_cq_depth_sum = 0;
+	uint64_t total_producer = 0;
+	uint64_t earliest_start = UINT64_MAX;
+	uint64_t latest_end = 0;
+
+	/* AK: Find earliest start and latest end timestamp across all cores */
+	for (lcore_id = 0; lcore_id < AK_MAX_LCORES; lcore_id++) {
+		struct ak_txq_depth_stats *stats = &ak_txq_stats[lcore_id];
+		if (stats->sample_count > 0) {
+			if (stats->start_timestamp < earliest_start)
+				earliest_start = stats->start_timestamp;
+			if (stats->end_timestamp > latest_end)
+				latest_end = stats->end_timestamp;
+		}
+	}
+
+	/* AK: Calculate actual test duration from TSC timestamps */
+	double test_duration = 10.0; /* Default fallback */
+	if (earliest_start != UINT64_MAX && latest_end > earliest_start) {
+		uint64_t tsc_hz = rte_get_tsc_hz();
+		uint64_t tsc_elapsed = latest_end - earliest_start;
+		test_duration = (double)tsc_elapsed / tsc_hz;
+	}
 
 	printf("\n");
-	printf("=====================================\n");
-	printf("AK: Per-Core TX Queue Depth Report\n");
-	printf("=====================================\n");
-	printf("Lcore    Samples      Total Depth  Avg Depth\n");
-	printf("-----    ----------   -----------  ---------\n");
+	printf("======================================================================================================================================================\n");
+	printf("AK: Per-Core TX Queue Depth and Producer Rate Report\n");
+	printf("======================================================================================================================================================\n");
+	printf("Test Duration: %.3f seconds (measured from TSC)\n", test_duration);
+	printf("Lcore    Producer (Mpps)  Samples      Avg WQE Depth  Avg Elts Depth  Avg CQ Depth  Tgt Burst Int  Avg Burst Interval  Avg Burst Processing\n");
+	printf("-----    ---------------  ----------   -------------  --------------  ------------  -------------  ------------------  --------------------\n");
 
 	for (lcore_id = 0; lcore_id < AK_MAX_LCORES; lcore_id++) {
 		struct ak_txq_depth_stats *stats = &ak_txq_stats[lcore_id];
@@ -81,30 +105,100 @@ ak_txq_depth_report(void)
 			continue;
 
 		double avg_depth = (double)stats->total_depth / stats->sample_count;
+		double avg_elts_depth = (double)stats->total_elts_depth / stats->sample_count;
+		double avg_cq_depth = (double)stats->total_cq_depth / stats->sample_count;
+		double producer_mpps = (double)stats->producer_count / test_duration / 1000000.0;
+		double avg_burst_interval = stats->burst_count > 0 ?
+			(double)stats->total_burst_interval / stats->burst_count : 0.0;
+		double avg_burst_processing = stats->burst_count > 0 ?
+			(double)stats->total_burst_processing_time / stats->burst_count : 0.0;
 
-		printf("%-5d    %-10lu   %-11lu  %.2f\n",
+		printf("%-5d    %-15.2f  %-10lu   %-13.2f  %-14.2f  %-12.2f  %-13lu  %-18.0f  %-20.0f\n",
 			lcore_id,
+			producer_mpps,
 			stats->sample_count,
-			stats->total_depth,
-			avg_depth);
+			avg_depth,
+			avg_elts_depth,
+			avg_cq_depth,
+			ak_target_burst_interval,
+			avg_burst_interval,
+			avg_burst_processing);
 
 		active_lcores++;
 		total_samples += stats->sample_count;
 		total_depth_sum += stats->total_depth;
+		total_elts_depth_sum += stats->total_elts_depth;
+		total_cq_depth_sum += stats->total_cq_depth;
+		total_producer += stats->producer_count;
 	}
 
-	printf("-----    ----------   -----------  ---------\n");
+	printf("-----    ---------------  ----------   -------------  --------------  ------------  -------------  ------------------  --------------------\n");
 
 	if (total_samples > 0) {
-		double overall_avg = (double)total_depth_sum / total_samples;
-		printf("Total    %-10lu   %-11lu  %.2f\n",
+		double overall_avg_depth = (double)total_depth_sum / total_samples;
+		double overall_avg_elts_depth = (double)total_elts_depth_sum / total_samples;
+		double overall_avg_cq_depth = (double)total_cq_depth_sum / total_samples;
+		double total_producer_mpps = (double)total_producer / test_duration / 1000000.0;
+		printf("Total    %-15.2f  %-10lu   %-13.2f  %-14.2f  %-12.2f  %-13lu  %-18s  %-20s\n",
+			total_producer_mpps,
 			total_samples,
-			total_depth_sum,
-			overall_avg);
+			overall_avg_depth,
+			overall_avg_elts_depth,
+			overall_avg_cq_depth,
+			ak_target_burst_interval,
+			"(see per-core)",
+			"(see per-core)");
 	}
 
 	printf("\nActive lcores: %d\n", active_lcores);
-	printf("=====================================\n");
+	printf("======================================================================================================================================================\n");
+	printf("\n");
+
+	/* CSV Format Output */
+	printf("CSV Format:\n");
+	printf("Lcore,Producer_Mpps,Samples,Avg_WQE_Depth,Avg_Elts_Depth,Avg_CQ_Depth,Tgt_Burst_Interval,Avg_Burst_Interval,Avg_Burst_Processing\n");
+
+	for (lcore_id = 0; lcore_id < AK_MAX_LCORES; lcore_id++) {
+		struct ak_txq_depth_stats *stats = &ak_txq_stats[lcore_id];
+
+		if (stats->sample_count == 0)
+			continue;
+
+		double avg_depth = (double)stats->total_depth / stats->sample_count;
+		double avg_elts_depth = (double)stats->total_elts_depth / stats->sample_count;
+		double avg_cq_depth = (double)stats->total_cq_depth / stats->sample_count;
+		double producer_mpps = (double)stats->producer_count / test_duration / 1000000.0;
+		double avg_burst_interval = stats->burst_count > 0 ?
+			(double)stats->total_burst_interval / stats->burst_count : 0.0;
+		double avg_burst_processing = stats->burst_count > 0 ?
+			(double)stats->total_burst_processing_time / stats->burst_count : 0.0;
+
+		printf("%d,%.2f,%lu,%.2f,%.2f,%.2f,%lu,%.0f,%.0f\n",
+			lcore_id,
+			producer_mpps,
+			stats->sample_count,
+			avg_depth,
+			avg_elts_depth,
+			avg_cq_depth,
+			ak_target_burst_interval,
+			avg_burst_interval,
+			avg_burst_processing);
+	}
+
+	if (total_samples > 0) {
+		double overall_avg_depth = (double)total_depth_sum / total_samples;
+		double overall_avg_elts_depth = (double)total_elts_depth_sum / total_samples;
+		double overall_avg_cq_depth = (double)total_cq_depth_sum / total_samples;
+		double total_producer_mpps = (double)total_producer / test_duration / 1000000.0;
+
+		printf("Total,%.2f,%lu,%.2f,%.2f,%.2f,%lu,N/A,N/A\n",
+			total_producer_mpps,
+			total_samples,
+			overall_avg_depth,
+			overall_avg_elts_depth,
+			overall_avg_cq_depth,
+			ak_target_burst_interval);
+	}
 	printf("\n");
 }
 #endif /* AK_ENABLE_QUEUE_DEPTH_TRACKING */
@@ -240,6 +334,7 @@ mlx5_tx_comp_flush(struct mlx5_txq_data *__rte_restrict txq,
 
 		txq->wqe_pi = rte_be_to_cpu_16(last_cqe->wqe_counter);
 		tail = txq->fcqs[(txq->cq_ci - 1) & txq->cqe_m];
+
 		if (likely(tail != txq->elts_tail)) {
 			mlx5_tx_free_elts(txq, tail, olx);
 			MLX5_ASSERT(tail == txq->elts_tail);

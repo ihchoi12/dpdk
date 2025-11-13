@@ -28,17 +28,7 @@
 
 #ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
 #include <rte_lcore.h>
-
-/* AK: Per-lcore TX queue depth statistics */
-#define AK_MAX_LCORES 128
-
-struct ak_txq_depth_stats {
-	uint64_t total_depth;   /* Accumulated queue depth */
-	uint64_t sample_count;  /* Number of samples */
-};
-
-/* Global per-lcore statistics array (defined in mlx5_tx.c) */
-extern struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+/* AK: Structure defined in rte_ethdev.h */
 #endif
 
 /* TX burst subroutines return codes. */
@@ -3695,9 +3685,31 @@ send_loop:
 		if (++ak_sample_counter % 10000 == 0) {
 			unsigned int lcore_id = rte_lcore_id();
 			if (lcore_id < AK_MAX_LCORES) {
-				uint16_t nb_used = txq->elts_head - txq->elts_tail;
-				ak_txq_stats[lcore_id].total_depth += nb_used;
-				ak_txq_stats[lcore_id].sample_count++;
+				struct ak_txq_depth_stats *stats = &ak_txq_stats[lcore_id];
+
+				/* WQE ring depth: in-flight WQEBBs (CI/PI are absolute counters) */
+				uint16_t wqe_used = (uint16_t)(txq->wqe_ci - txq->wqe_pi);
+
+				/* elts[] array depth: in-flight mbufs (head/tail are absolute counters) */
+				uint16_t elts_used = (uint16_t)(txq->elts_head - txq->elts_tail);
+
+				/* CQ depth: pending completions (PI - CI) */
+				uint16_t cq_used = (uint16_t)(txq->cq_pi - txq->cq_ci);
+
+				/* Debug: print first few samples to verify calculation */
+				static int debug_count = 0;
+				if (debug_count < 5) {
+					printf("AK DEBUG: lcore=%u wqe_ci=%u wqe_pi=%u wqe_s=%u wqe_m=%u wqe_used=%u elts_head=%u elts_tail=%u elts_s=%u elts_m=%u elts_used=%u cq_ci=%u cq_pi=%u cq_s=%u cq_m=%u cq_used=%u\n",
+						lcore_id, txq->wqe_ci, txq->wqe_pi, txq->wqe_s, txq->wqe_m, wqe_used,
+						txq->elts_head, txq->elts_tail, txq->elts_s, txq->elts_m, elts_used,
+						txq->cq_ci, txq->cq_pi, txq->cqe_s, txq->cqe_m, cq_used);
+					debug_count++;
+				}
+
+				stats->total_depth += wqe_used;
+				stats->total_elts_depth += elts_used;
+				stats->total_cq_depth += cq_used;
+				stats->sample_count++;
 			}
 		}
 	}

@@ -184,6 +184,29 @@ extern int rte_eth_dev_logtype;
 
 struct rte_mbuf;
 
+#ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
+/* AK: Per-lcore TX queue depth and producer/consumer rate statistics */
+#define AK_MAX_LCORES 128
+
+struct ak_txq_depth_stats {
+	uint64_t total_depth;      /* Accumulated WQE ring depth (WQEBBs) */
+	uint64_t total_elts_depth; /* Accumulated elts[] array depth (mbufs) */
+	uint64_t total_cq_depth;   /* Accumulated CQ depth (completion entries) */
+	uint64_t sample_count;     /* Number of samples */
+	uint64_t producer_count;   /* Total packets submitted by application */
+	uint64_t start_timestamp;  /* TSC timestamp when first packet was sent (0 = not started) */
+	uint64_t end_timestamp;    /* TSC timestamp when last packet was sent */
+	uint64_t last_burst_tsc;   /* TSC timestamp of last burst (for interval tracking) */
+	uint64_t total_burst_interval; /* Accumulated cycles between bursts */
+	uint64_t burst_count;      /* Number of bursts (for calculating average interval) */
+	uint64_t total_burst_processing_time; /* Accumulated cycles spent in burst processing (including retry loop) */
+};
+
+/* External declaration - defined in mlx5_tx.c */
+extern struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+extern uint64_t ak_target_burst_interval;  /* Target cycles between bursts (from pktgen config) */
+#endif
+
 /**
  * Initializes a device iterator.
  *

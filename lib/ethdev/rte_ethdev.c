@@ -49,6 +49,16 @@ struct rte_eth_fp_ops rte_eth_fp_ops[RTE_MAX_ETHPORTS];
 /* spinlock for add/remove Rx callbacks */
 static rte_spinlock_t eth_dev_rx_cb_lock = RTE_SPINLOCK_INITIALIZER;
 
+#ifdef AK_ENABLE_QUEUE_DEPTH_TRACKING
+/* AK: Global per-lcore TX queue depth and producer/consumer statistics */
+RTE_EXPORT_SYMBOL(ak_txq_stats)
+struct ak_txq_depth_stats ak_txq_stats[AK_MAX_LCORES];
+
+/* AK: Target burst interval (set by pktgen, used by tracking) */
+RTE_EXPORT_SYMBOL(ak_target_burst_interval)
+uint64_t ak_target_burst_interval = 0;
+#endif
+
 /* spinlock for add/remove Tx callbacks */
 static rte_spinlock_t eth_dev_tx_cb_lock = RTE_SPINLOCK_INITIALIZER;
 
