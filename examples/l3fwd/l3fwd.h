@@ -135,6 +135,8 @@ struct lcore_packet_stats {
 	uint64_t filtered_rx_packets;   /* RX packets excluding unwanted traffic like DHCP */
 	uint64_t filtered_tx_packets;   /* TX packets excluding unwanted traffic like DHCP */
 	uint64_t start_time;
+	uint64_t first_rx_time;         /* Timestamp of first packet received (for accurate rate) */
+	uint64_t last_rx_time;          /* Timestamp of last packet received (for accurate rate) */
 	/* Drop counters */
 	uint64_t dropped_invalid_ipv4;
 	uint64_t dropped_no_route;

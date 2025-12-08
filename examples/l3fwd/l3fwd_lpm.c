@@ -150,12 +150,26 @@ print_packet_stats(void)
 {
 	unsigned int lcore_id;
 	uint64_t total_rx = 0, total_tx = 0;
-	uint64_t current_time = rte_rdtsc();
 	uint64_t tsc_hz = rte_get_tsc_hz();
+
+	/* Find global earliest first_rx_time and latest last_rx_time for total duration */
+	uint64_t global_first_rx = UINT64_MAX, global_last_rx = 0;
+	RTE_LCORE_FOREACH(lcore_id) {
+		if (lcore_stats[lcore_id].first_rx_time > 0 && lcore_stats[lcore_id].first_rx_time < global_first_rx) {
+			global_first_rx = lcore_stats[lcore_id].first_rx_time;
+		}
+		if (lcore_stats[lcore_id].last_rx_time > global_last_rx) {
+			global_last_rx = lcore_stats[lcore_id].last_rx_time;
+		}
+	}
+	double total_elapsed_sec = 0;
+	if (global_first_rx != UINT64_MAX && global_last_rx > global_first_rx) {
+		total_elapsed_sec = (double)(global_last_rx - global_first_rx) / tsc_hz;
+	}
 
 	printf("\n");
 	printf("=====================================\n");
-	printf("L3FWD Packet Statistics Summary\n");
+	printf("L3FWD Packet Statistics Summary (Duration: %.2f sec)\n", total_elapsed_sec);
 	printf("=====================================\n");
 	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
 		"Lcore", "RX Packets", "TX Packets", "RX Mpps", "TX Mpps", "Loss%");
@@ -167,8 +181,12 @@ print_packet_stats(void)
 
 	RTE_LCORE_FOREACH(lcore_id) {
 		if (lcore_stats[lcore_id].start_time > 0) {
-			uint64_t duration = current_time - lcore_stats[lcore_id].start_time;
-			double elapsed_sec = (double)duration / tsc_hz;
+			/* Use first/last packet timestamps for accurate rate calculation */
+			double elapsed_sec = 0;
+			if (lcore_stats[lcore_id].first_rx_time > 0 && lcore_stats[lcore_id].last_rx_time > 0) {
+				uint64_t duration = lcore_stats[lcore_id].last_rx_time - lcore_stats[lcore_id].first_rx_time;
+				elapsed_sec = (double)duration / tsc_hz;
+			}
 			double rx_rate = elapsed_sec > 0 ? lcore_stats[lcore_id].filtered_rx_packets / elapsed_sec : 0;
 			double tx_rate = elapsed_sec > 0 ? lcore_stats[lcore_id].filtered_tx_packets / elapsed_sec : 0;
 			double loss_rate = lcore_stats[lcore_id].filtered_rx_packets > 0 ?
@@ -204,11 +222,13 @@ print_packet_stats(void)
 	total_excluded_tx = total_raw_tx - total_tx;
 
 	double total_loss_rate = total_rx > 0 ? (double)(total_rx - total_tx) * 100.0 / total_rx : 0.0;
+	double total_rx_mpps = total_elapsed_sec > 0 ? (double)total_rx / total_elapsed_sec / 1000000.0 : 0;
+	double total_tx_mpps = total_elapsed_sec > 0 ? (double)total_tx / total_elapsed_sec / 1000000.0 : 0;
 
 	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
 		"-----", "----------", "----------", "--------", "--------", "------");
-	printf("%-8s %-12" PRIu64 " %-12" PRIu64 " %-10s %-10s %-8.1f\n",
-		"Total", total_rx, total_tx, "", "", total_loss_rate);
+	printf("%-8s %-12" PRIu64 " %-12" PRIu64 " %-10.1f %-10.1f %-8.1f\n",
+		"Total", total_rx, total_tx, total_rx_mpps, total_tx_mpps, total_loss_rate);
 	printf("=====================================\n");
 	printf("ANALYSIS: RX/TX difference = %" PRIu64 " packets (%.1f%% loss)\n",
 		total_rx - total_tx, total_loss_rate);
@@ -519,6 +539,14 @@ lpm_main_loop(__rte_unused void *dummy)
 
 				lcore_stats[lcore_id].rx_packets += nb_rx;
 				lcore_stats[lcore_id].filtered_rx_packets += filtered_count;
+
+				/* Update timestamps only for filtered (benchmark) packets */
+				if (filtered_count > 0) {
+					uint64_t now = rte_rdtsc();
+					if (lcore_stats[lcore_id].first_rx_time == 0)
+						lcore_stats[lcore_id].first_rx_time = now;
+					lcore_stats[lcore_id].last_rx_time = now;
+				}
 			} else {
 #ifdef RTE_LIBRTE_ETHDEV_DEBUG
 				/* Analyze packets for debugging even when stats disabled */
