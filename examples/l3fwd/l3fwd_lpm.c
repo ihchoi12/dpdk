@@ -158,7 +158,7 @@ print_packet_stats(void)
 	printf("L3FWD Packet Statistics Summary\n");
 	printf("=====================================\n");
 	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
-		"Lcore", "RX Packets", "TX Packets", "RX Rate", "TX Rate", "Loss%");
+		"Lcore", "RX Packets", "TX Packets", "RX Mpps", "TX Mpps", "Loss%");
 	printf("%-8s %-12s %-12s %-10s %-10s %-8s\n",
 		"-----", "----------", "----------", "--------", "--------", "------");
 
