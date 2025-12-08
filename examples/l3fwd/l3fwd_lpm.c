@@ -36,6 +36,13 @@
 
 #include "lpm_route_parse.c"
 
+/*
+ * L3FWD_DROP_MODE: When defined, L3FWD receives packets but drops them
+ * instead of forwarding. Useful for testing RX-only performance.
+ * Comment out this line to restore normal forwarding behavior.
+ */
+#define L3FWD_DROP_MODE 1
+
 #define IPV4_L3FWD_LPM_MAX_RULES         1024
 #define IPV4_L3FWD_LPM_NUMBER_TBL8S (1 << 8)
 #define IPV6_L3FWD_LPM_MAX_RULES         1024
@@ -459,6 +466,9 @@ lpm_main_loop(__rte_unused void *dummy)
 	}
 
 	RTE_LOG(INFO, L3FWD, "[lpm] entering main loop on lcore %u\n", lcore_id);
+#ifdef L3FWD_DROP_MODE
+	RTE_LOG(WARNING, L3FWD, "*** DROP MODE: lcore %u will DROP all received packets ***\n", lcore_id);
+#endif
 	for (i = 0; i < n_rx_q; i++) {
 		portid = qconf->rx_queue_list[i].port_id;
 		queueid = qconf->rx_queue_list[i].queue_id;
@@ -557,6 +567,13 @@ lpm_main_loop(__rte_unused void *dummy)
 			}
 
 			AK_DEBUG_LOG_L3FWD("lcore %u received %d packets from port %u queue %u", lcore_id, nb_rx, portid, queueid);
+
+#ifdef L3FWD_DROP_MODE
+			/* DROP MODE: Free packets without forwarding */
+			for (int j = 0; j < nb_rx; j++) {
+				rte_pktmbuf_free(pkts_burst[j]);
+			}
+#else
 #if defined RTE_ARCH_X86 || defined __ARM_NEON \
 			 || defined RTE_ARCH_PPC_64
 			l3fwd_lpm_send_packets(nb_rx, pkts_burst,
@@ -565,6 +582,7 @@ lpm_main_loop(__rte_unused void *dummy)
 			l3fwd_lpm_no_opt_send_packets(nb_rx, pkts_burst,
 							portid, qconf);
 #endif /* X86 */
+#endif /* L3FWD_DROP_MODE */
 		}
 
 		cur_tsc = rte_rdtsc();
