@@ -323,9 +323,9 @@ signal_handler(int signum)
 	if (signum == SIGINT || signum == SIGTERM) {
 		printf("\nReceived signal %d, shutting down...\n", signum);
 		if (stats_enabled) {
+			stats_enabled = false;  /* Set false FIRST to prevent double printing from main loop */
 			print_packet_stats();
 		}
-		stats_enabled = false;
 		force_quit = true;
 	}
 }
