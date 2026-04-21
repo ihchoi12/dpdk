@@ -41,7 +41,7 @@
  * instead of forwarding. Useful for testing RX-only performance.
  * Comment out this line to restore normal forwarding behavior.
  */
-#define L3FWD_DROP_MODE 1
+// #define L3FWD_DROP_MODE 1
 
 #define IPV4_L3FWD_LPM_MAX_RULES         1024
 #define IPV4_L3FWD_LPM_NUMBER_TBL8S (1 << 8)
