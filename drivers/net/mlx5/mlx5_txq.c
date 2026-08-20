@@ -1674,6 +1674,73 @@ rte_pmd_mlx5_external_tx_queue_id_unmap(uint16_t port_id, uint16_t dpdk_idx)
  * ring is sized for the setup-time (maximum) budgets, hence shrinking
  * and restoring them at run time stays within the provisioned capacity.
  */
+
+/*
+ * Swap the port's tx_burst routine between the inline-capable and the
+ * non-inline specialization at run time.
+ *
+ * The non-inline routine never consults the per-queue inline budgets, and
+ * the inline routine operates correctly for any budget values within the
+ * setup-time maxima, so per-queue state is valid for both routines and the
+ * swap reduces to publishing a new function pointer. In-flight tx_burst
+ * calls complete on the old routine; each subsequent call loads the new
+ * pointer. Selection reuses mlx5_select_tx_function() with the first
+ * queue's inline budget masked, which is how that routine detects whether
+ * inlining is engaged.
+ */
+static int
+mlx5_txq_tx_template_swap(struct rte_tel_data *info, uint16_t port_id,
+			  bool disable_inline)
+{
+	struct rte_eth_dev *dev = &rte_eth_devices[port_id];
+	struct mlx5_priv *priv = dev->data->dev_private;
+	struct mlx5_txq_data *txq0;
+	eth_tx_burst_t fn;
+	uint16_t saved_send, saved_empw;
+	unsigned int i;
+
+	if (priv == NULL || priv->txqs == NULL || priv->txqs_n == 0) {
+		rte_tel_data_add_dict_string(info, "status", "no txqs");
+		return 0;
+	}
+	txq0 = (*priv->txqs)[0];
+	if (txq0 == NULL || txq0->inlen_send_max == 0) {
+		rte_tel_data_add_dict_string(info, "status",
+					     "inline not provisioned");
+		return 0;
+	}
+	if (disable_inline) {
+		/* Mask the inline budget so selection picks the
+		 * non-inline specialization, then restore it.
+		 */
+		saved_send = txq0->inlen_send;
+		saved_empw = txq0->inlen_empw;
+		txq0->inlen_send = 0;
+		txq0->inlen_empw = 0;
+		fn = mlx5_select_tx_function(dev);
+		txq0->inlen_send = saved_send;
+		txq0->inlen_empw = saved_empw;
+	} else {
+		for (i = 0; i < priv->txqs_n; i++) {
+			struct mlx5_txq_data *txq = (*priv->txqs)[i];
+
+			if (txq == NULL || txq->inlen_send_max == 0)
+				continue;
+			txq->inlen_send = txq->inlen_send_max;
+			txq->inlen_empw = txq->inlen_empw_max;
+		}
+		fn = mlx5_select_tx_function(dev);
+	}
+	dev->tx_pkt_burst = fn;
+	rte_eth_fp_ops[port_id].tx_pkt_burst = fn;
+	rte_tel_data_start_dict(info);
+	rte_tel_data_add_dict_string(info, "status", "ok");
+	rte_tel_data_add_dict_string(info, "template",
+				     disable_inline ? "noinline" : "inline");
+	rte_tel_data_add_dict_uint(info, "port", (uint64_t)port_id);
+	return 0;
+}
+
 static int
 mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
 			    struct rte_tel_data *info)
@@ -1687,13 +1754,14 @@ mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
 	const char *status = "ok";
 	char *end;
 
-	rte_tel_data_start_dict(info);
 	if (params == NULL) {
+		rte_tel_data_start_dict(info);
 		rte_tel_data_add_dict_string(info, "status", "missing params");
 		return 0;
 	}
 	port_id = strtoul(params, &end, 10);
 	if (end == params || *end != ',' || port_id >= RTE_MAX_ETHPORTS) {
+		rte_tel_data_start_dict(info);
 		rte_tel_data_add_dict_string(info, "status", "bad port");
 		return 0;
 	}
@@ -1702,17 +1770,24 @@ mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
 		minimal = true;
 	} else if (strncmp(mode, "full", 4) == 0) {
 		minimal = false;
+	} else if (strncmp(mode, "noinline", 8) == 0 ||
+		   strncmp(mode, "inline", 6) == 0) {
+		return mlx5_txq_tx_template_swap(info, (uint16_t)port_id,
+						 strncmp(mode, "noinline", 8) == 0);
 	} else {
+		rte_tel_data_start_dict(info);
 		rte_tel_data_add_dict_string(info, "status", "bad mode");
 		return 0;
 	}
 	if (!rte_eth_dev_is_valid_port((uint16_t)port_id)) {
+		rte_tel_data_start_dict(info);
 		rte_tel_data_add_dict_string(info, "status", "invalid port");
 		return 0;
 	}
 	dev = &rte_eth_devices[port_id];
 	priv = dev->data->dev_private;
 	if (priv == NULL || priv->txqs == NULL) {
+		rte_tel_data_start_dict(info);
 		rte_tel_data_add_dict_string(info, "status", "no txqs");
 		return 0;
 	}
@@ -1735,6 +1810,7 @@ mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
 	}
 	if (updated == 0)
 		status = "no inline-capable queues";
+	rte_tel_data_start_dict(info);
 	rte_tel_data_add_dict_string(info, "status", status);
 	rte_tel_data_add_dict_string(info, "mode", minimal ? "min" : "full");
 	rte_tel_data_add_dict_uint(info, "port", (uint64_t)port_id);
