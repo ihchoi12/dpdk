@@ -18,6 +18,7 @@
 #include <rte_common.h>
 #include <rte_eal_paging.h>
 #include <rte_bitops.h>
+#include <rte_telemetry.h>
 
 #include <mlx5_common.h>
 #include <mlx5_common_mr.h>
@@ -1171,6 +1172,8 @@ mlx5_txq_new(struct rte_eth_dev *dev, uint16_t idx, uint16_t desc,
 	tmpl->txq.idx = idx;
 	txq_set_params(tmpl);
 	txq_adjust_params(tmpl);
+	tmpl->txq.inlen_send_max = tmpl->txq.inlen_send;
+	tmpl->txq.inlen_empw_max = tmpl->txq.inlen_empw;
 	wqebb_cnt = txq_calc_wqebb_cnt(tmpl, !!mlx5_devx_obj_ops_en(priv->sh));
 	max_wqe = mlx5_dev_get_max_wq_size(priv->sh);
 	if (wqebb_cnt > max_wqe) {
@@ -1658,4 +1661,90 @@ rte_pmd_mlx5_external_tx_queue_id_unmap(uint16_t port_id, uint16_t dpdk_idx)
 		"Port %u external TxQ index %u is successfully unmapped.",
 		port_id, dpdk_idx);
 	return 0;
+}
+
+/*
+ * Runtime switch between full and minimal data-inline budgets.
+ *
+ * With minimal budgets every packet above the 18B floor takes the pointer
+ * path inside the inline-capable tx_burst template, approximating the
+ * non-inline template without reselecting the tx function. The budget
+ * fields are per-queue uint16 values reloaded on every tx_burst call and
+ * aligned stores are atomic on x86, so no quiescing is needed. The WQE
+ * ring is sized for the setup-time (maximum) budgets, hence shrinking
+ * and restoring them at run time stays within the provisioned capacity.
+ */
+static int
+mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
+			    struct rte_tel_data *info)
+{
+	struct rte_eth_dev *dev;
+	struct mlx5_priv *priv;
+	unsigned int i, updated = 0;
+	unsigned long port_id;
+	bool minimal;
+	const char *mode;
+	const char *status = "ok";
+	char *end;
+
+	rte_tel_data_start_dict(info);
+	if (params == NULL) {
+		rte_tel_data_add_dict_string(info, "status", "missing params");
+		return 0;
+	}
+	port_id = strtoul(params, &end, 10);
+	if (end == params || *end != ',' || port_id >= RTE_MAX_ETHPORTS) {
+		rte_tel_data_add_dict_string(info, "status", "bad port");
+		return 0;
+	}
+	mode = end + 1;
+	if (strncmp(mode, "min", 3) == 0) {
+		minimal = true;
+	} else if (strncmp(mode, "full", 4) == 0) {
+		minimal = false;
+	} else {
+		rte_tel_data_add_dict_string(info, "status", "bad mode");
+		return 0;
+	}
+	if (!rte_eth_dev_is_valid_port((uint16_t)port_id)) {
+		rte_tel_data_add_dict_string(info, "status", "invalid port");
+		return 0;
+	}
+	dev = &rte_eth_devices[port_id];
+	priv = dev->data->dev_private;
+	if (priv == NULL || priv->txqs == NULL) {
+		rte_tel_data_add_dict_string(info, "status", "no txqs");
+		return 0;
+	}
+	for (i = 0; i < priv->txqs_n; i++) {
+		struct mlx5_txq_data *txq = (*priv->txqs)[i];
+
+		if (txq == NULL || txq->inlen_send_max == 0)
+			continue;
+		if (minimal) {
+			txq->inlen_send = MLX5_ESEG_MIN_INLINE_SIZE +
+					  MLX5_WQE_DSEG_SIZE;
+			txq->inlen_empw = txq->inlen_empw_max ?
+					  MLX5_WQE_SIZE +
+					  MLX5_DSEG_MIN_INLINE_SIZE : 0;
+		} else {
+			txq->inlen_send = txq->inlen_send_max;
+			txq->inlen_empw = txq->inlen_empw_max;
+		}
+		updated++;
+	}
+	if (updated == 0)
+		status = "no inline-capable queues";
+	rte_tel_data_add_dict_string(info, "status", status);
+	rte_tel_data_add_dict_string(info, "mode", minimal ? "min" : "full");
+	rte_tel_data_add_dict_uint(info, "port", (uint64_t)port_id);
+	rte_tel_data_add_dict_uint(info, "queues_updated", updated);
+	return 0;
+}
+
+RTE_INIT(mlx5_txq_inline_telemetry_init)
+{
+	rte_telemetry_register_cmd("/mlx5/tx_inline_set",
+				   mlx5_txq_inline_set_handler,
+				   "Set Tx data-inline budgets. Params: <port>,<full|min>");
 }

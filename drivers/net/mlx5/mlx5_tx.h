@@ -181,6 +181,8 @@ struct __rte_cache_aligned mlx5_txq_data {
 	struct mlx5_txq_stats stats; /* TX queue counters. */
 	struct mlx5_txq_stats stats_reset; /* stats on last reset. */
 	struct mlx5_uar_data uar_data;
+	uint16_t inlen_send_max; /* Send inline budget computed at setup. */
+	uint16_t inlen_empw_max; /* eMPW inline budget computed at setup. */
 	struct rte_mbuf *elts[];
 	/* Storage for queued packets, must be the last field. */
 };
