@@ -1883,6 +1883,46 @@ mlx5_txq_dump_handler(const char *cmd __rte_unused, const char *params,
 	return 0;
 }
 
+/*
+ * Stop and restart one Tx queue through the ethdev API, which takes the
+ * send queue through a hardware reset. The application must not be
+ * transmitting on that queue while this runs.
+ */
+static int
+mlx5_txq_restart_handler(const char *cmd __rte_unused, const char *params,
+			 struct rte_tel_data *info)
+{
+	unsigned long port_id, queue;
+	char *end, *end2;
+	int ret;
+
+	rte_tel_data_start_dict(info);
+	if (params == NULL) {
+		rte_tel_data_add_dict_string(info, "status", "missing params");
+		return 0;
+	}
+	port_id = strtoul(params, &end, 10);
+	if (end == params || *end != ',' || port_id >= RTE_MAX_ETHPORTS ||
+	    !rte_eth_dev_is_valid_port((uint16_t)port_id)) {
+		rte_tel_data_add_dict_string(info, "status", "bad port");
+		return 0;
+	}
+	queue = strtoul(end + 1, &end2, 10);
+	if (end2 == end + 1) {
+		rte_tel_data_add_dict_string(info, "status", "bad queue");
+		return 0;
+	}
+	ret = rte_eth_dev_tx_queue_stop((uint16_t)port_id, (uint16_t)queue);
+	if (ret == 0)
+		ret = rte_eth_dev_tx_queue_start((uint16_t)port_id,
+						 (uint16_t)queue);
+	rte_tel_data_add_dict_string(info, "status", ret == 0 ? "ok" : "failed");
+	rte_tel_data_add_dict_int(info, "ret", ret);
+	rte_tel_data_add_dict_uint(info, "port", (uint64_t)port_id);
+	rte_tel_data_add_dict_uint(info, "queue", (uint64_t)queue);
+	return 0;
+}
+
 RTE_INIT(mlx5_txq_inline_telemetry_init)
 {
 	rte_telemetry_register_cmd("/mlx5/tx_inline_set",
@@ -1891,4 +1931,7 @@ RTE_INIT(mlx5_txq_inline_telemetry_init)
 	rte_telemetry_register_cmd("/mlx5/txq_dump",
 				   mlx5_txq_dump_handler,
 				   "Dump Tx queue indexes. Params: <port>");
+	rte_telemetry_register_cmd("/mlx5/txq_restart",
+				   mlx5_txq_restart_handler,
+				   "Stop and restart a Tx queue. Params: <port>,<queue>");
 }
