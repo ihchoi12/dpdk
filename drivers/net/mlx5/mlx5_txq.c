@@ -1818,9 +1818,77 @@ mlx5_txq_inline_set_handler(const char *cmd __rte_unused, const char *params,
 	return 0;
 }
 
+/*
+ * Dump the live indexes of every Tx queue of a port: ring occupancy
+ * (elts, WQE, CQ), completion bookkeeping and the inline budgets.
+ */
+static int
+mlx5_txq_dump_handler(const char *cmd __rte_unused, const char *params,
+		      struct rte_tel_data *info)
+{
+	struct rte_eth_dev *dev;
+	struct mlx5_priv *priv;
+	unsigned long port_id;
+	unsigned int i;
+	char *end;
+
+	rte_tel_data_start_dict(info);
+	if (params == NULL) {
+		rte_tel_data_add_dict_string(info, "status", "missing params");
+		return 0;
+	}
+	port_id = strtoul(params, &end, 10);
+	if (end == params || port_id >= RTE_MAX_ETHPORTS ||
+	    !rte_eth_dev_is_valid_port((uint16_t)port_id)) {
+		rte_tel_data_add_dict_string(info, "status", "bad port");
+		return 0;
+	}
+	dev = &rte_eth_devices[port_id];
+	priv = dev->data->dev_private;
+	if (priv == NULL || priv->txqs == NULL) {
+		rte_tel_data_add_dict_string(info, "status", "no txqs");
+		return 0;
+	}
+	for (i = 0; i < priv->txqs_n; i++) {
+		struct mlx5_txq_data *txq = (*priv->txqs)[i];
+		struct rte_tel_data *d;
+		char name[16];
+
+		if (txq == NULL)
+			continue;
+		d = rte_tel_data_alloc();
+		if (d == NULL)
+			break;
+		rte_tel_data_start_dict(d);
+		rte_tel_data_add_dict_uint(d, "elts_head", txq->elts_head);
+		rte_tel_data_add_dict_uint(d, "elts_tail", txq->elts_tail);
+		rte_tel_data_add_dict_uint(d, "elts_comp", txq->elts_comp);
+		rte_tel_data_add_dict_uint(d, "elts_s", txq->elts_s);
+		rte_tel_data_add_dict_uint(d, "wqe_ci", txq->wqe_ci);
+		rte_tel_data_add_dict_uint(d, "wqe_pi", txq->wqe_pi);
+		rte_tel_data_add_dict_uint(d, "wqe_comp", txq->wqe_comp);
+		rte_tel_data_add_dict_uint(d, "wqe_s", txq->wqe_s);
+		rte_tel_data_add_dict_uint(d, "wqe_thres", txq->wqe_thres);
+		rte_tel_data_add_dict_uint(d, "cq_ci", txq->cq_ci);
+		rte_tel_data_add_dict_uint(d, "cq_pi", txq->cq_pi);
+		rte_tel_data_add_dict_uint(d, "cqe_s", txq->cqe_s);
+		rte_tel_data_add_dict_uint(d, "inlen_send", txq->inlen_send);
+		rte_tel_data_add_dict_uint(d, "inlen_empw", txq->inlen_empw);
+		rte_tel_data_add_dict_uint(d, "inlen_mode", txq->inlen_mode);
+		rte_tel_data_add_dict_uint(d, "oerrors", txq->stats.oerrors);
+		snprintf(name, sizeof(name), "q%u", i);
+		rte_tel_data_add_dict_container(info, name, d, 0);
+	}
+	rte_tel_data_add_dict_string(info, "status", "ok");
+	return 0;
+}
+
 RTE_INIT(mlx5_txq_inline_telemetry_init)
 {
 	rte_telemetry_register_cmd("/mlx5/tx_inline_set",
 				   mlx5_txq_inline_set_handler,
 				   "Set Tx data-inline budgets. Params: <port>,<full|min>");
+	rte_telemetry_register_cmd("/mlx5/txq_dump",
+				   mlx5_txq_dump_handler,
+				   "Dump Tx queue indexes. Params: <port>");
 }
